@@ -867,10 +867,12 @@ class QuickBloomBitsReader : public BuiltinFilterBitsReader {
   ~QuickBloomBitsReader() override = default;
 
   bool MayMatch(const Slice& key) override {
+    // Match quickbloom's qb_*_contains exactly: hash -> block_for ->
+    // mask_for -> load -> testc, with no prefetch. PrepareHash is
+    // only used in the batched path below, where there's a
+    // separation between the prefetch and the use.
     uint64_t h = GetSliceHash64(key);
-    uint32_t byte_offset;
-    QuickBloomImpl::PrepareHash(h, len_bytes_, data_, /*out*/ &byte_offset);
-    return QuickBloomImpl::HashMayMatchPrepared(h, data_ + byte_offset);
+    return QuickBloomImpl::HashMayMatch(h, len_bytes_, data_);
   }
 
   void MayMatch(int num_keys, Slice** keys, bool* may_match) override {

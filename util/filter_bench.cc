@@ -86,7 +86,8 @@ DEFINE_bool(new_builder, false,
 DEFINE_uint32(impl, 0,
               "Select filter implementation. Without -use_plain_table_bloom:"
               "0 = legacy full Bloom filter, "
-              "1 = format_version 5 Bloom filter, 2 = Ribbon128 filter. With "
+              "1 = format_version 5 Bloom filter, 2 = Ribbon128 filter, "
+              "3 = QuickBloom (256-bit SBBF, K=8, AVX2). With "
               "-use_plain_table_bloom: 0 = no locality, 1 = locality.");
 
 DEFINE_bool(net_includes_hashing, false,
@@ -360,9 +361,9 @@ void FilterBench::Go() {
           "-impl must currently be >= 0 and <= 1 for Plain table");
     }
   } else {
-    if (FLAGS_impl > 2) {
+    if (FLAGS_impl > 3) {
       throw std::runtime_error(
-          "-impl must currently be >= 0 and <= 2 for Block-based table");
+          "-impl must currently be >= 0 and <= 3 for Block-based table");
     }
   }
 

@@ -32,6 +32,7 @@
 #include "util/bloom_impl.h"
 #include "util/hash.h"
 #include "util/math.h"
+#include "util/quickbloom_impl.h"
 #include "util/ribbon_config.h"
 #include "util/ribbon_impl.h"
 #include "util/string_util.h"
@@ -628,6 +629,246 @@ class FastLocalBloomBitsReader : public BuiltinFilterBitsReader {
  private:
   const char* data_;
   const int num_probes_;
+  const uint32_t len_bytes_;
+};
+
+// #################### QuickBloom implementation ###################### //
+// Split Block Bloom Filter with 32-byte (256-bit) blocks and K=8 fixed
+// SBBF salts. See `util/quickbloom_impl.h` for kernel details. Reuses
+// XXPH3FilterBitsBuilder's deferred-Finish path with hash-entry
+// buffering so we only diverge from FastLocalBloom in the AddAllEntries
+// inner loop and the metadata bytes written at the end of the filter.
+
+class QuickBloomBitsBuilder : public XXPH3FilterBitsBuilder {
+ public:
+  // Non-null aggregate_rounding_balance implies optimize_filters_for_memory
+  explicit QuickBloomBitsBuilder(
+      const int millibits_per_key,
+      std::atomic<int64_t>* aggregate_rounding_balance,
+      std::shared_ptr<CacheReservationManager> cache_res_mgr,
+      bool detect_filter_construct_corruption)
+      : XXPH3FilterBitsBuilder(aggregate_rounding_balance, cache_res_mgr,
+                               detect_filter_construct_corruption),
+        millibits_per_key_(millibits_per_key) {
+    assert(millibits_per_key >= 1000);
+  }
+
+  // No Copy allowed
+  QuickBloomBitsBuilder(const QuickBloomBitsBuilder&) = delete;
+  void operator=(const QuickBloomBitsBuilder&) = delete;
+
+  ~QuickBloomBitsBuilder() override = default;
+
+  using FilterBitsBuilder::Finish;
+
+  Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    return Finish(buf, nullptr);
+  }
+
+  Slice Finish(std::unique_ptr<const char[]>* buf, Status* status) override {
+    size_t num_entries = hash_entries_info_.entries.size();
+    if (num_entries == 0) {
+      if (status) {
+        *status = Status::OK();
+      }
+      return FinishAlwaysFalse(buf);
+    }
+
+    size_t len_with_metadata = CalculateSpace(num_entries);
+
+    std::unique_ptr<char[]> mutable_buf;
+    std::unique_ptr<CacheReservationManager::CacheReservationHandle>
+        final_filter_cache_res_handle;
+    len_with_metadata =
+        AllocateMaybeRounding(len_with_metadata, num_entries, &mutable_buf);
+    if (cache_res_mgr_) {
+      Status s = cache_res_mgr_->MakeCacheReservation(
+          len_with_metadata * sizeof(char), &final_filter_cache_res_handle);
+      s.PermitUncheckedError();
+    }
+
+    assert(mutable_buf);
+    assert(len_with_metadata >= kMetadataLen);
+
+    // Max size supported by implementation
+    assert(len_with_metadata <= 0xffffffffU);
+
+    uint32_t len = static_cast<uint32_t>(len_with_metadata - kMetadataLen);
+    if (len > 0) {
+      TEST_SYNC_POINT_CALLBACK(
+          "XXPH3FilterBitsBuilder::Finish::"
+          "TamperHashEntries",
+          &hash_entries_info_.entries);
+      AddAllEntries(mutable_buf.get(), len);
+      Status verify_hash_entries_checksum_status =
+          MaybeVerifyHashEntriesChecksum();
+      if (!verify_hash_entries_checksum_status.ok()) {
+        if (status) {
+          *status = verify_hash_entries_checksum_status;
+        }
+        return FinishAlwaysTrue(buf);
+      }
+    }
+
+    bool keep_entries_for_postverify = detect_filter_construct_corruption_;
+    if (!keep_entries_for_postverify) {
+      ResetEntries();
+    }
+
+    // Trailer: same shape as the FastLocalBloom trailer so the
+    // existing reader-dispatch byte at len_with_meta-5 (== -1)
+    // continues to identify "new Bloom implementation". The
+    // sub-implementation byte at len_with_meta-4 selects which new
+    // Bloom we are: 0 = FastLocalBloom, 1 = QuickBloom. The remaining
+    // three bytes are written zero (no num_probes parameter; K is
+    // fixed at 8 in the kernel, and 32-byte block size is implied by
+    // sub_impl == 1).
+    mutable_buf[len] = static_cast<char>(-1);
+    mutable_buf[len + 1] = static_cast<char>(1);  // sub_impl: QuickBloom
+    mutable_buf[len + 2] = 0;
+    mutable_buf[len + 3] = 0;
+    mutable_buf[len + 4] = 0;
+
+    auto TEST_arg_pair __attribute__((__unused__)) =
+        std::make_pair(&mutable_buf, len_with_metadata);
+    TEST_SYNC_POINT_CALLBACK("XXPH3FilterBitsBuilder::Finish::TamperFilter",
+                             &TEST_arg_pair);
+
+    Slice rv(mutable_buf.get(), len_with_metadata);
+    *buf = std::move(mutable_buf);
+    final_filter_cache_res_handles_.push_back(
+        std::move(final_filter_cache_res_handle));
+    if (status) {
+      *status = Status::OK();
+    }
+    return rv;
+  }
+
+  size_t ApproximateNumEntries(size_t bytes) override {
+    size_t bytes_no_meta =
+        bytes >= kMetadataLen ? RoundDownUsableSpace(bytes) - kMetadataLen : 0;
+    return static_cast<size_t>(uint64_t{8000} * bytes_no_meta /
+                               millibits_per_key_);
+  }
+
+  size_t CalculateSpace(size_t num_entries) override {
+    size_t raw_target_len = static_cast<size_t>(
+        (uint64_t{num_entries} * millibits_per_key_ + 7999) / 8000);
+
+    if (raw_target_len >= size_t{0xffffffc0}) {
+      raw_target_len = size_t{0xffffffc0};
+    }
+
+    // Round up to a multiple of the 32-byte block size so every block
+    // is fully addressable. Smaller rounding than FastLocalBloom's 64,
+    // tolerable because the block is smaller.
+    return ((raw_target_len + 31) & ~size_t{31}) + kMetadataLen;
+  }
+
+  double EstimatedFpRate(size_t keys, size_t len_with_metadata) override {
+    if (len_with_metadata <= kMetadataLen) {
+      return keys > 0 ? 1.0 : 0.0;
+    }
+    return QuickBloomImpl::EstimatedFpRate(
+        keys, len_with_metadata - kMetadataLen, /*hash bits*/ 64);
+  }
+
+ protected:
+  size_t RoundDownUsableSpace(size_t available_size) override {
+    size_t rv = available_size - kMetadataLen;
+
+    if (rv >= size_t{0xffffffc0}) {
+      rv = size_t{0xffffffc0};
+    }
+
+    // round down to multiple of 32 (block size)
+    rv &= ~size_t{31};
+
+    return rv + kMetadataLen;
+  }
+
+ private:
+  // Mirror FastLocalBloomBitsBuilder::AddAllEntries: prime a ring of
+  // hash/offset slots, then for each new entry process the oldest
+  // slot (AddHashPrepared) while issuing PrepareHash for a fresh one
+  // a buffer-length ahead. Hides the L1 miss for blocks that fall
+  // outside cache.
+  void AddAllEntries(char* data, uint32_t len) {
+    const size_t num_entries = hash_entries_info_.entries.size();
+    constexpr size_t kBufferMask = 7;
+    static_assert(((kBufferMask + 1) & kBufferMask) == 0,
+                  "Must be power of 2 minus 1");
+
+    std::array<uint64_t, kBufferMask + 1> hashes;
+    std::array<uint32_t, kBufferMask + 1> byte_offsets;
+
+    size_t i = 0;
+    std::deque<uint64_t>::iterator hash_entries_it =
+        hash_entries_info_.entries.begin();
+    for (; i <= kBufferMask && i < num_entries; ++i) {
+      uint64_t h = *hash_entries_it;
+      QuickBloomImpl::PrepareHash(h, len, data, /*out*/ &byte_offsets[i]);
+      hashes[i] = h;
+      ++hash_entries_it;
+    }
+
+    for (; i < num_entries; ++i) {
+      uint64_t& hash_ref = hashes[i & kBufferMask];
+      uint32_t& byte_offset_ref = byte_offsets[i & kBufferMask];
+      QuickBloomImpl::AddHashPrepared(hash_ref, data + byte_offset_ref);
+      uint64_t h = *hash_entries_it;
+      QuickBloomImpl::PrepareHash(h, len, data, /*out*/ &byte_offset_ref);
+      hash_ref = h;
+      ++hash_entries_it;
+    }
+
+    for (i = 0; i <= kBufferMask && i < num_entries; ++i) {
+      QuickBloomImpl::AddHashPrepared(hashes[i], data + byte_offsets[i]);
+    }
+  }
+
+  // Target allocation per added key, in thousandths of a bit.
+  int millibits_per_key_;
+};
+
+class QuickBloomBitsReader : public BuiltinFilterBitsReader {
+ public:
+  QuickBloomBitsReader(const char* data, uint32_t len_bytes)
+      : data_(data), len_bytes_(len_bytes) {}
+
+  // No Copy allowed
+  QuickBloomBitsReader(const QuickBloomBitsReader&) = delete;
+  void operator=(const QuickBloomBitsReader&) = delete;
+
+  ~QuickBloomBitsReader() override = default;
+
+  bool MayMatch(const Slice& key) override {
+    uint64_t h = GetSliceHash64(key);
+    uint32_t byte_offset;
+    QuickBloomImpl::PrepareHash(h, len_bytes_, data_, /*out*/ &byte_offset);
+    return QuickBloomImpl::HashMayMatchPrepared(h, data_ + byte_offset);
+  }
+
+  void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
+    std::array<uint64_t, MultiGetContext::MAX_BATCH_SIZE> hashes;
+    std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> byte_offsets;
+    for (int i = 0; i < num_keys; ++i) {
+      hashes[i] = GetSliceHash64(*keys[i]);
+      QuickBloomImpl::PrepareHash(hashes[i], len_bytes_, data_,
+                                  /*out*/ &byte_offsets[i]);
+    }
+    for (int i = 0; i < num_keys; ++i) {
+      may_match[i] = QuickBloomImpl::HashMayMatchPrepared(
+          hashes[i], data_ + byte_offsets[i]);
+    }
+  }
+
+  bool HashMayMatch(const uint64_t h) override {
+    return QuickBloomImpl::HashMayMatch(h, len_bytes_, data_);
+  }
+
+ private:
+  const char* data_;
   const uint32_t len_bytes_;
 };
 
@@ -1524,6 +1765,31 @@ FilterBitsBuilder* BloomLikeFilterPolicy::GetFastLocalBloomBuilderWithContext(
       cache_res_mgr, context.table_options.detect_filter_construct_corruption);
 }
 
+FilterBitsBuilder* BloomLikeFilterPolicy::GetQuickBloomBuilderWithContext(
+    const FilterBuildingContext& context) const {
+  bool offm = context.table_options.optimize_filters_for_memory;
+  const auto options_overrides_iter =
+      context.table_options.cache_usage_options.options_overrides.find(
+          CacheEntryRole::kFilterConstruction);
+  const auto filter_construction_charged =
+      options_overrides_iter !=
+              context.table_options.cache_usage_options.options_overrides.end()
+          ? options_overrides_iter->second.charged
+          : context.table_options.cache_usage_options.options.charged;
+
+  std::shared_ptr<CacheReservationManager> cache_res_mgr;
+  if (context.table_options.block_cache &&
+      filter_construction_charged ==
+          CacheEntryRoleOptions::Decision::kEnabled) {
+    cache_res_mgr = std::make_shared<
+        CacheReservationManagerImpl<CacheEntryRole::kFilterConstruction>>(
+        context.table_options.block_cache);
+  }
+  return new QuickBloomBitsBuilder(
+      millibits_per_key_, offm ? &aggregate_rounding_balance_ : nullptr,
+      cache_res_mgr, context.table_options.detect_filter_construct_corruption);
+}
+
 FilterBitsBuilder* BloomLikeFilterPolicy::GetLegacyBloomBuilderWithContext(
     const FilterBuildingContext& context) const {
   if (whole_bits_per_key_ >= 14 && context.info_log &&
@@ -1642,6 +1908,19 @@ FilterBitsBuilder* Standard128RibbonFilterPolicy::GetBuilderWithContext(
     return nullptr;
   }
   return GetStandard128RibbonBuilderWithContext(context);
+}
+
+const char* QuickBloomFilterPolicy::kClassName() {
+  return "rocksdb.internal.QuickBloomFilter";
+}
+
+FilterBitsBuilder* QuickBloomFilterPolicy::GetBuilderWithContext(
+    const FilterBuildingContext& context) const {
+  if (GetMillibitsPerKey() == 0) {
+    // "No filter" special case
+    return nullptr;
+  }
+  return GetQuickBloomBuilderWithContext(context);
 }
 
 }  // namespace test
@@ -1773,10 +2052,11 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBloomBitsReader(
   //               | char{-1} byte -> new Bloom filter |
   //         len+1 +-----------------------------------+
   //               | byte for subimplementation        |
-  //               |   0: FastLocalBloom               |
+  //               |   0: FastLocalBloom (64B block)   |
+  //               |   1: QuickBloom (32B block, K=8)  |
   //               |   other: reserved                 |
   //         len+2 +-----------------------------------+
-  //               | byte for block_and_probes         |
+  //               | byte for block_and_probes (sub=0) |
   //               |   0 in top 3 bits -> 6 -> 64-byte |
   //               |   reserved:                       |
   //               |   1 in top 3 bits -> 7 -> 128-byte|
@@ -1784,6 +2064,7 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBloomBitsReader(
   //               |   ...                             |
   //               |   num_probes in bottom 5 bits,    |
   //               |     except 0 and 31 reserved      |
+  //               | reserved (sub=1, K is fixed at 8) |
   //         len+3 +-----------------------------------+
   //               | two bytes reserved                |
   //               |   possibly for hash seed          |
@@ -1791,14 +2072,6 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBloomBitsReader(
 
   // Read more metadata (see above)
   char sub_impl_val = contents.data()[len_with_meta - 4];
-  char block_and_probes = contents.data()[len_with_meta - 3];
-  int log2_block_bytes = ((block_and_probes >> 5) & 7) + 6;
-
-  int num_probes = (block_and_probes & 31);
-  if (num_probes < 1 || num_probes > 30) {
-    // Reserved / future safe
-    return new AlwaysTrueFilter();
-  }
 
   uint16_t rest = DecodeFixed16(contents.data() + len_with_meta - 2);
   if (rest != 0) {
@@ -1807,10 +2080,29 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBloomBitsReader(
     return new AlwaysTrueFilter();
   }
 
-  if (sub_impl_val == 0) {        // FastLocalBloom
+  if (sub_impl_val == 0) {  // FastLocalBloom
+    char block_and_probes = contents.data()[len_with_meta - 3];
+    int log2_block_bytes = ((block_and_probes >> 5) & 7) + 6;
+    int num_probes = (block_and_probes & 31);
+    if (num_probes < 1 || num_probes > 30) {
+      // Reserved / future safe
+      return new AlwaysTrueFilter();
+    }
     if (log2_block_bytes == 6) {  // Only block size supported for now
       return new FastLocalBloomBitsReader(contents.data(), num_probes, len);
     }
+  } else if (sub_impl_val == 1) {  // QuickBloom
+    // K is fixed at 8, block size is fixed at 32 bytes; byte at -3 is
+    // currently reserved-zero.
+    if (contents.data()[len_with_meta - 3] != 0) {
+      return new AlwaysTrueFilter();
+    }
+    if ((len & 31) != 0) {
+      // QuickBloom requires len to be a multiple of the 32-byte block
+      // size. A mismatched filter is treated as future-reserved.
+      return new AlwaysTrueFilter();
+    }
+    return new QuickBloomBitsReader(contents.data(), len);
   }
   // otherwise
   // Reserved / future safe
@@ -1910,6 +2202,8 @@ std::shared_ptr<const FilterPolicy> BloomLikeFilterPolicy::Create(
     return std::make_shared<test::FastLocalBloomFilterPolicy>(bits_per_key);
   } else if (name == test::Standard128RibbonFilterPolicy::kClassName()) {
     return std::make_shared<test::Standard128RibbonFilterPolicy>(bits_per_key);
+  } else if (name == test::QuickBloomFilterPolicy::kClassName()) {
+    return std::make_shared<test::QuickBloomFilterPolicy>(bits_per_key);
   } else if (name == BloomFilterPolicy::kClassName()) {
     // For testing
     return std::make_shared<BloomFilterPolicy>(bits_per_key);
@@ -2026,6 +2320,14 @@ static int RegisterBuiltinFilterPolicies(ObjectLibrary& library,
                 uri));
         return guard->get();
       });
+  library.AddFactory<const FilterPolicy>(
+      FilterPatternEntryWithBits(test::QuickBloomFilterPolicy::kClassName()),
+      [](const std::string& uri, std::unique_ptr<const FilterPolicy>* guard,
+         std::string* /* errmsg */) {
+        guard->reset(
+            NewBuiltinFilterPolicyWithBits<test::QuickBloomFilterPolicy>(uri));
+        return guard->get();
+      });
   size_t num_types;
   return static_cast<int>(library.GetFactoryCount(&num_types));
 }
@@ -2072,6 +2374,7 @@ const std::vector<std::string>& BloomLikeFilterPolicy::GetAllFixedImpls() {
       test::LegacyBloomFilterPolicy::kClassName(),
       test::FastLocalBloomFilterPolicy::kClassName(),
       test::Standard128RibbonFilterPolicy::kClassName(),
+      test::QuickBloomFilterPolicy::kClassName(),
   };
   return impls;
 }

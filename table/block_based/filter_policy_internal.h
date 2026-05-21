@@ -219,6 +219,8 @@ class BloomLikeFilterPolicy : public BuiltinFilterPolicy {
       const FilterBuildingContext& context) const;
   FilterBitsBuilder* GetStandard128RibbonBuilderWithContext(
       const FilterBuildingContext& context) const;
+  FilterBitsBuilder* GetQuickBloomBuilderWithContext(
+      const FilterBuildingContext& context) const;
 
   std::string GetBitsPerKeySuffix() const;
 
@@ -334,6 +336,18 @@ class Standard128RibbonFilterPolicy : public BloomLikeFilterPolicy {
  public:
   explicit Standard128RibbonFilterPolicy(double bloom_equiv_bits_per_key)
       : BloomLikeFilterPolicy(bloom_equiv_bits_per_key) {}
+
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext& context) const override;
+
+  static const char* kClassName();
+  const char* Name() const override { return kClassName(); }
+};
+
+class QuickBloomFilterPolicy : public BloomLikeFilterPolicy {
+ public:
+  explicit QuickBloomFilterPolicy(double bits_per_key)
+      : BloomLikeFilterPolicy(bits_per_key) {}
 
   FilterBitsBuilder* GetBuilderWithContext(
       const FilterBuildingContext& context) const override;

@@ -46,6 +46,7 @@ const std::string kFastLocalBloom =
     test::FastLocalBloomFilterPolicy::kClassName();
 const std::string kStandard128Ribbon =
     test::Standard128RibbonFilterPolicy::kClassName();
+const std::string kQuickBloom = test::QuickBloomFilterPolicy::kClassName();
 }  // namespace
 
 static const int kVerbose = 1;
@@ -512,14 +513,25 @@ inline uint32_t SelectByCacheLineSize(uint32_t for64, uint32_t for128,
 // ability to read filters generated using other cache line sizes.
 // See RawSchema.
 TEST_P(FullBloomTest, Schema) {
+  // QuickBloom uses a different SBBF block geometry and fixed K=8, so
+  // the exact byte-pattern fingerprints captured for the
+  // FastLocalBloom / LegacyBloom / Ribbon schemas do not apply. Its
+  // own correctness is exercised by the other FullBloomTest cases
+  // (FullSmall, FullVaryingLengths, OptimizeForMemory) and by the
+  // Build/Verify pass in `filter_bench`.
+  if (GetParam() == kQuickBloom) {
+    ROCKSDB_GTEST_SKIP("Schema fingerprints are specific to other impls");
+    return;
+  }
+
   // Match how this test was originally built
   table_options_.optimize_filters_for_memory = false;
 
-#define EXPECT_EQ_Bloom(a, b)               \
-  {                                         \
-    if (GetParam() != kStandard128Ribbon) { \
-      EXPECT_EQ(a, b);                      \
-    }                                       \
+#define EXPECT_EQ_Bloom(a, b)                                            \
+  {                                                                      \
+    if (GetParam() != kStandard128Ribbon && GetParam() != kQuickBloom) { \
+      EXPECT_EQ(a, b);                                                   \
+    }                                                                    \
   }
 #define EXPECT_EQ_Ribbon(a, b)              \
   {                                         \
@@ -539,11 +551,11 @@ TEST_P(FullBloomTest, Schema) {
       EXPECT_EQ(a, b);                \
     }                                 \
   }
-#define EXPECT_EQ_NotLegacy(a, b)     \
-  {                                   \
-    if (GetParam() != kLegacyBloom) { \
-      EXPECT_EQ(a, b);                \
-    }                                 \
+#define EXPECT_EQ_NotLegacy(a, b)                                  \
+  {                                                                \
+    if (GetParam() != kLegacyBloom && GetParam() != kQuickBloom) { \
+      EXPECT_EQ(a, b);                                             \
+    }                                                              \
   }
 
   char buffer[sizeof(int)];
@@ -1083,7 +1095,7 @@ TEST_P(FullBloomTest, CorruptFilters) {
 
 INSTANTIATE_TEST_CASE_P(Full, FullBloomTest,
                         testing::Values(kLegacyBloom, kFastLocalBloom,
-                                        kStandard128Ribbon));
+                                        kStandard128Ribbon, kQuickBloom));
 
 static double GetEffectiveBitsPerKey(FilterBitsBuilder* builder) {
   union {

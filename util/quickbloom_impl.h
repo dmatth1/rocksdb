@@ -11,16 +11,27 @@
 // / arrow-rs / Velox / DuckDB; this is the AVX2-optimised single-key
 // kernel.
 //
-// Differences from upstream quickbloom (kept the kernel intact, adapted
-// only the addressing to RocksDB conventions):
-//   - Block index uses `FastRange32(Lower32of64(h), num_blocks)` rather
-//     than bitmasking a power-of-2 block count. This matches the
-//     RocksDB `FastLocalBloomImpl` sizing model and removes the
-//     power-of-2 constraint on filter size.
-//   - The 32-bit probe hash is `Upper32of64(h)` (RocksDB convention)
-//     rather than the low half of the 64-bit hash.
-//   - Loads/stores use the unaligned AVX2 intrinsics; RocksDB filter
-//     buffers are not guaranteed 32-byte aligned.
+// Algorithm match with upstream quickbloom main @ b212685:
+//   - SBBF salt vector: identical (8 constants).
+//   - Block index: `(h >> 32) & (nblocks - 1)`, requiring power-of-2
+//     nblocks. Matches `block_for` in `bloom_sbbf.c`.
+//   - 32-bit hash driving the mask: `(uint32_t)h` (low half).
+//     Matches `mask_for((uint32_t)h)` in `bloom_sbbf.c`.
+//   - Mask compute: `vpmullo + vpsrli(>>27) + vpsllv` of an
+//     all-ones broadcast. Single `vptest` settles the probe.
+//   - Block geometry: 256-bit blocks, K=8 (one bit per 32-bit lane).
+//   - Prefetch: `__builtin_prefetch(blk, 0, 0)` — read, NTA / no
+//     temporal locality. Matches `prefetch_block_for` in
+//     `bloom_sbbf.c`.
+//
+// Only adaptations to RocksDB conventions:
+//   - Loads/stores use the unaligned AVX2 intrinsics
+//     (`_mm256_loadu_si256` / `_mm256_storeu_si256`); RocksDB filter
+//     buffers are not guaranteed 32-byte aligned, unlike quickbloom's
+//     posix_memalign-backed allocation.
+//   - Wired into the builder/reader interfaces below, the on-disk
+//     SBBF data is identical to what `bloom_sbbf.c` would produce
+//     for the same key-hash sequence and `nblocks`.
 //
 // Differences from `FastLocalBloomImpl` (the win we're benchmarking):
 //   - 256-bit blocks (32 bytes) instead of 512-bit cache-line blocks,
@@ -38,10 +49,8 @@
 
 #include <cstring>
 
-#include "port/port.h"        // for PREFETCH
+#include "rocksdb/rocksdb_namespace.h"
 #include "util/bloom_impl.h"  // for BloomMath
-#include "util/fastrange.h"
-#include "util/hash.h"
 
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -94,25 +103,28 @@ class QuickBloomImpl {
   // block.
   static inline void AddHashPrepared(uint64_t h, char* data_at_block) {
 #ifdef __AVX2__
-    const __m256i mask = MaskFor(Upper32of64(h));
+    const __m256i mask = MaskFor(static_cast<uint32_t>(h));
     __m256i* p = reinterpret_cast<__m256i*>(data_at_block);
     __m256i cur = _mm256_loadu_si256(p);
     _mm256_storeu_si256(p, _mm256_or_si256(cur, mask));
 #else
-    ScalarAdd(Upper32of64(h), data_at_block);
+    ScalarAdd(static_cast<uint32_t>(h), data_at_block);
 #endif
   }
 
   // Compute the 32-byte block offset for `h` within `len_bytes` of
   // filter data, prefetch the block, and store the offset for the
-  // caller to use later.
+  // caller to use later. `len_bytes` must equal nblocks * 32 with
+  // nblocks a power of two; this is enforced at filter construction
+  // and validated when a filter is loaded.
   static inline void PrepareHash(uint64_t h, uint32_t len_bytes,
                                  const char* data,
                                  uint32_t /*out*/ * block_offset) {
     uint32_t off = BlockOffset(h, len_bytes);
-    // 32-byte block fits in a single cache line, so one prefetch is
+    // Match quickbloom: read, no temporal locality (NTA). 32-byte
+    // block fits in a single cache line, so one prefetch is
     // sufficient (vs. two for the 64-byte FastLocalBloom block).
-    PREFETCH(data + off, 0 /* rw */, 1 /* locality */);
+    __builtin_prefetch(data + off, 0 /* rw */, 0 /* locality (NTA) */);
     *block_offset = off;
   }
 
@@ -127,25 +139,26 @@ class QuickBloomImpl {
   static inline bool HashMayMatchPrepared(uint64_t h,
                                           const char* data_at_block) {
 #ifdef __AVX2__
-    const __m256i mask = MaskFor(Upper32of64(h));
+    const __m256i mask = MaskFor(static_cast<uint32_t>(h));
     const __m256i cur = _mm256_loadu_si256(
         reinterpret_cast<const __m256i*>(data_at_block));
     // testc(cur, mask) is true iff (~cur & mask) == 0, i.e. every bit
     // demanded by the mask is already set in the block.
     return _mm256_testc_si256(cur, mask) != 0;
 #else
-    return ScalarMatch(Upper32of64(h), data_at_block);
+    return ScalarMatch(static_cast<uint32_t>(h), data_at_block);
 #endif
   }
 
  private:
   // Map a 64-bit hash to a 32-byte block offset within the filter.
-  // Mirrors `FastLocalBloomImpl`'s FastRange32 trick, but with a
-  // 32-byte (rather than 64-byte) block stride: nblocks = len_bytes /
-  // 32.
+  // Matches `bloom_sbbf.c` `block_for`: `(h >> 32) & (nblocks - 1)`,
+  // multiplied by the 32-byte block stride. `len_bytes` must be
+  // power-of-two * 32, so `num_blocks - 1` is a valid bitmask.
   static inline uint32_t BlockOffset(uint64_t h, uint32_t len_bytes) {
     uint32_t num_blocks = len_bytes >> 5;  // 32-byte blocks
-    return FastRange32(Lower32of64(h), num_blocks) << 5;
+    uint32_t idx = static_cast<uint32_t>(h >> 32) & (num_blocks - 1);
+    return idx << 5;
   }
 
 #ifdef __AVX2__

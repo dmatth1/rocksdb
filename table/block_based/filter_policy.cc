@@ -752,17 +752,26 @@ class QuickBloomBitsBuilder : public XXPH3FilterBitsBuilder {
   }
 
   size_t CalculateSpace(size_t num_entries) override {
-    size_t raw_target_len = static_cast<size_t>(
-        (uint64_t{num_entries} * millibits_per_key_ + 7999) / 8000);
-
-    if (raw_target_len >= size_t{0xffffffc0}) {
-      raw_target_len = size_t{0xffffffc0};
+    // Mirror quickbloom's qb_*_new sizing: target_bits ->
+    // nblocks = ceil(target_bits / 256) -> round nblocks up to the
+    // next power of two -> filter bytes = nblocks * 32. The
+    // power-of-two requirement is what lets the kernel use a
+    // bitmask block index.
+    uint64_t target_bits = uint64_t{num_entries} * millibits_per_key_;
+    uint64_t nblocks =
+        (target_bits + (256ULL * 1000ULL - 1ULL)) / (256ULL * 1000ULL);
+    if (nblocks == 0) {
+      nblocks = 1;
     }
-
-    // Round up to a multiple of the 32-byte block size so every block
-    // is fully addressable. Smaller rounding than FastLocalBloom's 64,
-    // tolerable because the block is smaller.
-    return ((raw_target_len + 31) & ~size_t{31}) + kMetadataLen;
+    nblocks = RoundUpToPow2(nblocks);
+    constexpr uint64_t kMaxBytes = uint64_t{0xffffffc0};
+    uint64_t bytes = nblocks * 32ULL;
+    if (bytes > kMaxBytes) {
+      uint64_t cap_blocks = kMaxBytes >> 5;
+      nblocks = uint64_t{1} << (63 - __builtin_clzll(cap_blocks));
+      bytes = nblocks * 32ULL;
+    }
+    return static_cast<size_t>(bytes) + kMetadataLen;
   }
 
   double EstimatedFpRate(size_t keys, size_t len_with_metadata) override {
@@ -781,13 +790,28 @@ class QuickBloomBitsBuilder : public XXPH3FilterBitsBuilder {
       rv = size_t{0xffffffc0};
     }
 
-    // round down to multiple of 32 (block size)
-    rv &= ~size_t{31};
+    // nblocks must be power-of-two (kernel uses bitmask block index).
+    // Round nblocks down to the largest power-of-two that fits in rv.
+    size_t nblocks = rv >> 5;
+    if (nblocks == 0) {
+      nblocks = 1;
+    } else {
+      nblocks = size_t{1} << (63 - __builtin_clzll(nblocks));
+    }
+    rv = nblocks << 5;
 
     return rv + kMetadataLen;
   }
 
  private:
+  static inline uint64_t RoundUpToPow2(uint64_t n) {
+    if (n <= 1) {
+      return 1;
+    }
+    int hi = 63 - __builtin_clzll(n - 1);
+    return uint64_t{1} << (hi + 1);
+  }
+
   // Mirror FastLocalBloomBitsBuilder::AddAllEntries: prime a ring of
   // hash/offset slots, then for each new entry process the oldest
   // slot (AddHashPrepared) while issuing PrepareHash for a fresh one
@@ -2097,9 +2121,13 @@ BuiltinFilterBitsReader* BuiltinFilterPolicy::GetBloomBitsReader(
     if (contents.data()[len_with_meta - 3] != 0) {
       return new AlwaysTrueFilter();
     }
-    if ((len & 31) != 0) {
-      // QuickBloom requires len to be a multiple of the 32-byte block
-      // size. A mismatched filter is treated as future-reserved.
+    // QuickBloom kernel uses a bitmask block index, so nblocks must
+    // be a non-zero power of two and len must equal nblocks * 32.
+    if ((len & 31) != 0 || len == 0) {
+      return new AlwaysTrueFilter();
+    }
+    uint32_t nblocks = len >> 5;
+    if ((nblocks & (nblocks - 1)) != 0) {
       return new AlwaysTrueFilter();
     }
     return new QuickBloomBitsReader(contents.data(), len);
